@@ -1,0 +1,50 @@
+[
+    {
+        "type": 2.0,
+        "value": "F:/design/water/cc switch.png",
+        "retry": 1,
+        "order": 1
+    },
+    {
+        "type": 5.0,
+        "value": "2",
+        "retry": 1,
+        "order": 2
+    },
+    {
+        "type": 2.0,
+        "value": "F:/design/water/tu.png",
+        "retry": 1,
+        "order": 3
+    },
+    {
+        "type": 5.0,
+        "value": "2",
+        "retry": 1,
+        "order": 4
+    },
+    {
+        "type": 2.0,
+        "value": "F:/design/water/chrome.png",
+        "retry": 1,
+        "order": 5
+    },
+    {
+        "type": 5.0,
+        "value": "1",
+        "retry": 1,
+        "order": 6
+    },
+    {
+        "type": 10.0,
+        "value": "process=chrome.exe",
+        "retry": 1,
+        "order": 7
+    },
+    {
+        "type": 7.0,
+        "value": "f11",
+        "retry": 1,
+        "order": 8
+    }
+]
