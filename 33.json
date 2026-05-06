@@ -1,0 +1,26 @@
+[
+    {
+        "type": 11.0,
+        "value": "",
+        "retry": 1,
+        "order": 1
+    },
+    {
+        "type": 2.0,
+        "value": "F:/design/water/chrome.png",
+        "retry": 1,
+        "order": 2
+    },
+    {
+        "type": 10.0,
+        "value": "title=chrome",
+        "retry": 1,
+        "order": 3
+    },
+    {
+        "type": 7.0,
+        "value": "f11",
+        "retry": 1,
+        "order": 4
+    }
+]

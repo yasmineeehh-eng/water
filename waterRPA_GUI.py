@@ -11,6 +11,7 @@ from typing import Callable
 import pyautogui
 import pyperclip
 from PySide6.QtCore import QEvent, Qt, QThread, Signal
+from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -31,20 +32,33 @@ from PySide6.QtWidgets import (
 
 
 IMAGE_ACTIONS = {1.0, 2.0, 3.0, 8.0}
+VALUELESS_ACTIONS = {11.0}
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp"}
+SCREENSHOT_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp"}
+MAX_LOG_LINES = 1000
 START_SHORTCUT_KEY = Qt.Key_F1
 START_SHORTCUT_LABEL = "F1"
 STOP_SHORTCUT_KEY = Qt.Key_Escape
 STOP_SHORTCUT_LABEL = "Esc"
 
 
-def get_autosave_path() -> str:
+def get_app_data_dir() -> str:
     base_dir = os.environ.get("APPDATA") or os.path.dirname(os.path.abspath(sys.argv[0]))
     config_dir = os.path.join(base_dir, "WaterRPA Studio")
     os.makedirs(config_dir, exist_ok=True)
-    return os.path.join(config_dir, "last_tasks.json")
+    return config_dir
+
+
+def get_autosave_path() -> str:
+    return os.path.join(get_app_data_dir(), "last_tasks.json")
+
+
+def get_runtime_log_path() -> str:
+    return os.path.join(get_app_data_dir(), "runtime.log")
 
 
 AUTOSAVE_PATH = get_autosave_path()
+RUNTIME_LOG_PATH = get_runtime_log_path()
 
 CMD_TYPES = {
     "左键单击": 1.0,
@@ -57,6 +71,7 @@ CMD_TYPES = {
     "鼠标悬停": 8.0,
     "截图保存": 9.0,
     "激活窗口": 10.0,
+    "显示桌面": 11.0,
 }
 
 CMD_TYPES_REV = {value: key for key, value in CMD_TYPES.items()}
@@ -104,6 +119,22 @@ class Task:
 
 def log_to_stdout(message: str) -> None:
     print(message, flush=True)
+
+
+def atomic_write_json(path: str, data) -> None:
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    temp_path = f"{path}.tmp"
+    with open(temp_path, "w", encoding="utf-8") as file:
+        json.dump(data, file, indent=4, ensure_ascii=False)
+    os.replace(temp_path, path)
+
+
+def append_runtime_log(message: str) -> None:
+    try:
+        with open(RUNTIME_LOG_PATH, "a", encoding="utf-8") as file:
+            file.write(message + "\n")
+    except Exception:
+        pass
 
 
 def qt_key_to_pyautogui_name(key: int, text: str) -> str:
@@ -191,9 +222,14 @@ class RPAEngine:
         return self.stop_requested
 
     def wait_until_image(self, img: str, timeout: float, callback_msg: Callable[[str], None] | None):
+        if not os.path.isfile(img):
+            raise FileNotFoundError(f"图片文件不存在：{img}")
+
         start_time = time.time()
+        next_report_time = 0.0
 
         while not self.should_stop():
+            now = time.time()
             if timeout and time.time() - start_time > timeout:
                 raise TimeoutError(f"等待图片超时：{img}，已等待 {timeout} 秒")
 
@@ -203,10 +239,13 @@ class RPAEngine:
                     return location
             except pyautogui.ImageNotFoundException:
                 pass
+            except Exception as exc:
+                raise RuntimeError(f"图片识别失败：{img}，原因：{exc}") from exc
 
-            if callback_msg:
+            if callback_msg and now >= next_report_time:
                 callback_msg(f"未找到图片，继续查找：{img}")
-            time.sleep(0.2)
+                next_report_time = now + 2
+            self.sleep_with_stop(0.2)
 
         raise InterruptedError("任务已停止")
 
@@ -235,7 +274,7 @@ class RPAEngine:
             count += 1
 
             if retry == -1:
-                time.sleep(0.2)
+                self.sleep_with_stop(0.2)
                 continue
 
             if count >= total:
@@ -259,7 +298,7 @@ class RPAEngine:
             if window:
                 hwnd, title, pid, process_name = window
                 self.bring_window_to_front(hwnd)
-                time.sleep(0.3)
+                self.sleep_with_stop(0.3)
                 self.emit(callback_msg, f"已激活窗口：{title} / {process_name} / PID {pid}")
                 return
 
@@ -267,7 +306,7 @@ class RPAEngine:
                 raise TimeoutError(f"等待窗口超时：{query}，已等待 {timeout} 秒")
 
             self.emit(callback_msg, f"未找到窗口，继续查找：{query}")
-            time.sleep(0.2)
+            self.sleep_with_stop(0.2)
 
         raise InterruptedError("任务已停止")
 
@@ -350,6 +389,11 @@ class RPAEngine:
         self.user32.BringWindowToTop(hwnd)
         self.user32.SetForegroundWindow(hwnd)
 
+    def show_desktop(self, callback_msg: Callable[[str], None] | None):
+        pyautogui.hotkey("win", "m")
+        self.sleep_with_stop(0.5)
+        self.emit(callback_msg, "已显示桌面")
+
     def run_tasks(
         self,
         tasks: list[Task],
@@ -384,7 +428,7 @@ class RPAEngine:
                 if loop_interval_minutes > 0:
                     self.sleep_with_stop(loop_interval_minutes * 60)
                 else:
-                    time.sleep(0.2)
+                    self.sleep_with_stop(0.2)
 
         except InterruptedError as exc:
             if callback_msg:
@@ -392,7 +436,10 @@ class RPAEngine:
         except Exception as exc:
             if callback_msg:
                 callback_msg(f"执行出错：{exc}")
-            traceback.print_exc()
+                callback_msg("详细错误已写入运行日志")
+                callback_msg(traceback.format_exc())
+            else:
+                traceback.print_exc()
         finally:
             self.is_running = False
             if callback_msg:
@@ -414,8 +461,9 @@ class RPAEngine:
             self.emit(callback_msg, f"右键单击：{cmd_value}")
         elif cmd_type == 4.0:
             pyperclip.copy(str(cmd_value))
+            self.sleep_with_stop(0.1)
             pyautogui.hotkey("ctrl", "v")
-            time.sleep(0.5)
+            self.sleep_with_stop(0.5)
             self.emit(callback_msg, f"输入文本：{cmd_value}")
         elif cmd_type == 5.0:
             self.sleep_with_stop(float(cmd_value))
@@ -434,14 +482,21 @@ class RPAEngine:
             self.emit(callback_msg, f"鼠标悬停：{cmd_value}")
         elif cmd_type == 9.0:
             filename = self.resolve_screenshot_path(cmd_value)
+            parent_dir = os.path.dirname(os.path.abspath(filename))
+            os.makedirs(parent_dir, exist_ok=True)
             pyautogui.screenshot(filename)
             self.emit(callback_msg, f"截图已保存：{filename}")
         elif cmd_type == 10.0:
             self.activate_window(cmd_value, timeout, callback_msg)
+        elif cmd_type == 11.0:
+            self.show_desktop(callback_msg)
         else:
             raise ValueError(f"未知指令类型：{cmd_type}")
 
     def sleep_with_stop(self, seconds: float):
+        if seconds < 0:
+            raise ValueError("等待时间不能小于 0")
+
         end_time = time.time() + seconds
         while time.time() < end_time:
             if self.should_stop():
@@ -451,12 +506,15 @@ class RPAEngine:
     @staticmethod
     def resolve_screenshot_path(path: str) -> str:
         path = str(path).strip()
+        if not path:
+            raise ValueError("截图保存路径不能为空")
+
         if os.path.isdir(path):
             timestamp = time.strftime("%Y%m%d_%H%M%S")
             return os.path.join(path, f"screenshot_{timestamp}.png")
 
         root, ext = os.path.splitext(path)
-        if ext.lower() not in {".png", ".jpg", ".jpeg", ".bmp"}:
+        if ext.lower() not in SCREENSHOT_EXTENSIONS:
             return f"{path}.png"
         return path
 
@@ -610,6 +668,7 @@ class TaskRow(QFrame):
         self.file_btn.setVisible(cmd_type in IMAGE_ACTIONS or cmd_type == 9.0)
         self.shortcut_btn.setVisible(cmd_type == 7.0)
         self.retry_input.setVisible(cmd_type in IMAGE_ACTIONS)
+        self.value_input.setEnabled(cmd_type not in VALUELESS_ACTIONS)
 
         if cmd_type in IMAGE_ACTIONS:
             self.file_btn.setText("选择图片")
@@ -627,6 +686,9 @@ class TaskRow(QFrame):
             self.value_input.setPlaceholderText("截图保存目录或文件路径")
         elif cmd_type == 10.0:
             self.value_input.setPlaceholderText("title=窗口标题关键词 或 process=程序名.exe，例如 title=Chrome")
+        elif cmd_type == 11.0:
+            self.value_input.setText("")
+            self.value_input.setPlaceholderText("无需参数，会最小化所有窗口并显示桌面")
 
     def set_data(self, data):
         cmd_type = data.get("type")
@@ -663,13 +725,19 @@ class TaskRow(QFrame):
         value = self.value_input.text().strip()
         retry = 1
         order_text = self.order_input.text().strip() or str(self.index)
-        order = int(order_text)
+        try:
+            order = int(order_text)
+        except ValueError as exc:
+            raise ValueError("执行顺序必须是整数") from exc
         if order <= 0:
             raise ValueError("执行顺序必须是大于 0 的整数")
 
         if self.retry_input.isVisible():
             retry_text = self.retry_input.text().strip() or "1"
-            retry = int(retry_text)
+            try:
+                retry = int(retry_text)
+            except ValueError as exc:
+                raise ValueError("重试次数必须是整数") from exc
             if retry == 0 or retry < -1:
                 raise ValueError("重试次数只能是 -1、1 或大于 1 的整数")
 
@@ -759,6 +827,11 @@ class RPAWindow(QMainWindow):
         self.load_btn = self.create_header_button("↥  导入")
         self.load_btn.clicked.connect(self.load_config)
         layout.addWidget(self.load_btn)
+
+        self.check_btn = self.create_header_button("✓  检查")
+        self.check_btn.setToolTip("检查配置是否可以稳定运行，不会真正执行鼠标键盘操作")
+        self.check_btn.clicked.connect(self.check_task)
+        layout.addWidget(self.check_btn)
 
         divider = QFrame()
         divider.setObjectName("headerDivider")
@@ -1118,6 +1191,194 @@ class RPAWindow(QMainWindow):
             suffix = "COMMAND" if count == 1 else "COMMANDS"
             self.command_count_label.setText(f"{count} {suffix} LOADED")
 
+    def parse_timeout_settings(self) -> tuple[float, float, list[str]]:
+        errors = []
+
+        try:
+            timeout = float(self.timeout_input.text().strip() or "60")
+            if timeout <= 0:
+                errors.append("图片/窗口等待超时必须大于 0")
+        except ValueError:
+            timeout = 60
+            errors.append("图片/窗口等待超时必须是数字")
+
+        try:
+            loop_interval = float(self.loop_interval_input.text().strip() or "0")
+            if loop_interval < 0:
+                errors.append("循环间隔分钟数不能小于 0")
+        except ValueError:
+            loop_interval = 0
+            errors.append("循环间隔分钟数必须是数字")
+
+        return timeout, loop_interval, errors
+
+    def read_rows_with_errors(self, require_value: bool = False) -> tuple[list[tuple[int, Task]], list[str]]:
+        errors = []
+        indexed_tasks = []
+
+        for index, row in enumerate(self.rows, start=1):
+            try:
+                task = row.get_data()
+            except ValueError as exc:
+                errors.append(f"第 {index} 条：{exc}")
+                continue
+
+            if require_value and not task.value and task.type not in VALUELESS_ACTIONS:
+                errors.append(f"第 {index} 条：指令参数为空")
+                continue
+
+            indexed_tasks.append((index, task))
+
+        indexed_tasks.sort(key=lambda item: (item[1].order, item[0]))
+        return indexed_tasks, errors
+
+    def validate_task_runtime(self, source_index: int, task: Task) -> list[str]:
+        errors = []
+        cmd_name = CMD_TYPES_REV.get(task.type, str(task.type))
+        prefix = f"第 {source_index} 条（{cmd_name}）"
+        value = str(task.value).strip()
+
+        if task.type not in CMD_TYPES_REV:
+            return [f"第 {source_index} 条：未知指令类型 {task.type}"]
+
+        if task.type in VALUELESS_ACTIONS:
+            return errors
+
+        if not value:
+            return [f"{prefix}：参数不能为空"]
+
+        if task.type in IMAGE_ACTIONS:
+            ext = os.path.splitext(value)[1].lower()
+            if ext not in IMAGE_EXTENSIONS:
+                errors.append(f"{prefix}：图片格式仅支持 png/jpg/jpeg/bmp")
+            if not os.path.isfile(value):
+                errors.append(f"{prefix}：图片文件不存在：{value}")
+
+        elif task.type == 5.0:
+            try:
+                seconds = float(value)
+                if seconds < 0:
+                    errors.append(f"{prefix}：等待秒数不能小于 0")
+            except ValueError:
+                errors.append(f"{prefix}：等待秒数必须是数字")
+
+        elif task.type == 6.0:
+            try:
+                int(value)
+            except ValueError:
+                errors.append(f"{prefix}：滚动距离必须是整数")
+
+        elif task.type == 7.0:
+            keys = [key.strip() for key in value.split("+") if key.strip()]
+            if not keys:
+                errors.append(f"{prefix}：系统按键不能为空")
+
+        elif task.type == 9.0:
+            try:
+                filename = RPAEngine.resolve_screenshot_path(value)
+                parent_dir = os.path.dirname(os.path.abspath(filename))
+                os.makedirs(parent_dir, exist_ok=True)
+                if not os.access(parent_dir, os.W_OK):
+                    errors.append(f"{prefix}：截图保存目录不可写：{parent_dir}")
+            except Exception as exc:
+                errors.append(f"{prefix}：截图保存路径不可用：{exc}")
+
+        elif task.type == 10.0:
+            try:
+                RPAEngine.parse_window_query(value)
+            except ValueError as exc:
+                errors.append(f"{prefix}：{exc}")
+
+        return errors
+
+    def validate_runtime_config(self) -> tuple[list[Task], float, float, list[str]]:
+        timeout, loop_interval, errors = self.parse_timeout_settings()
+        indexed_tasks, row_errors = self.read_rows_with_errors(require_value=True)
+        errors.extend(row_errors)
+
+        if not indexed_tasks:
+            errors.append("请至少添加一条有效指令")
+
+        for source_index, task in indexed_tasks:
+            errors.extend(self.validate_task_runtime(source_index, task))
+
+        tasks = [task for _, task in indexed_tasks]
+        if self.loop_check.currentText() != "循环执行":
+            loop_interval = 0
+
+        return tasks, timeout, loop_interval, errors
+
+    def show_validation_errors(self, title: str, errors: list[str]) -> None:
+        QMessageBox.warning(self, title, "\n".join(errors[:30]))
+
+    def format_task_summary(self, task: Task) -> str:
+        name = CMD_TYPES_REV.get(task.type, str(task.type))
+        value = str(task.value)
+        if len(value) > 80:
+            value = value[:77] + "..."
+        return f"{name}：{value}"
+
+    def check_task(self):
+        tasks, timeout, loop_interval, errors = self.validate_runtime_config()
+        if errors:
+            self.show_validation_errors("检查未通过", errors)
+            self.log(f"运行前检查未通过：{len(errors)} 个问题")
+            for error in errors:
+                self.log(error)
+            return
+
+        self.log(f"运行前检查通过：{len(tasks)} 条指令，超时 {timeout:g} 秒，循环间隔 {loop_interval:g} 分钟")
+        QMessageBox.information(self, "检查通过", f"配置可运行，共 {len(tasks)} 条指令。")
+
+    @staticmethod
+    def normalize_task_config(data, index: int) -> tuple[dict | None, str | None]:
+        if not isinstance(data, dict):
+            return None, f"第 {index} 项不是对象"
+
+        try:
+            cmd_type = float(data.get("type"))
+        except (TypeError, ValueError):
+            return None, f"第 {index} 项指令类型无效"
+
+        if cmd_type not in CMD_TYPES_REV:
+            return None, f"第 {index} 项未知指令类型：{cmd_type}"
+
+        try:
+            retry = int(data.get("retry", 1))
+        except (TypeError, ValueError):
+            return None, f"第 {index} 项重试次数无效"
+
+        if retry == 0 or retry < -1:
+            return None, f"第 {index} 项重试次数只能是 -1、1 或大于 1 的整数"
+
+        try:
+            order = int(data.get("order", index))
+        except (TypeError, ValueError):
+            return None, f"第 {index} 项执行顺序无效"
+
+        if order <= 0:
+            return None, f"第 {index} 项执行顺序必须大于 0"
+
+        return {
+            "type": cmd_type,
+            "value": str(data.get("value", "")).strip(),
+            "retry": retry,
+            "order": order,
+        }, None
+
+    def normalize_config_items(self, items: list) -> tuple[list[dict], list[str]]:
+        valid_items = []
+        errors = []
+
+        for index, item in enumerate(items, start=1):
+            normalized, error = self.normalize_task_config(item, index)
+            if error:
+                errors.append(error)
+                continue
+            valid_items.append(normalized)
+
+        return valid_items, errors
+
     def serialize_rows(self, allow_empty: bool = False) -> list[dict]:
         tasks = []
         for row in self.rows:
@@ -1133,8 +1394,7 @@ class RPAWindow(QMainWindow):
 
         try:
             tasks = self.serialize_rows(allow_empty=False)
-            with open(AUTOSAVE_PATH, "w", encoding="utf-8") as file:
-                json.dump(tasks, file, indent=4, ensure_ascii=False)
+            atomic_write_json(AUTOSAVE_PATH, tasks)
         except ValueError:
             return
         except Exception as exc:
@@ -1151,6 +1411,12 @@ class RPAWindow(QMainWindow):
             if not isinstance(tasks, list) or not tasks:
                 return False
 
+            tasks, errors = self.normalize_config_items(tasks)
+            if not tasks:
+                if errors:
+                    self.log(f"自动恢复失败：{errors[0]}")
+                return False
+
             self.autosave_suspended = True
             try:
                 for task in tasks:
@@ -1161,20 +1427,17 @@ class RPAWindow(QMainWindow):
             self.renumber_rows()
             self.update_command_count()
             self.log(f"已自动恢复 {len(tasks)} 条指令")
+            if errors:
+                self.log(f"自动恢复已跳过 {len(errors)} 条无效指令")
             return True
         except Exception as exc:
             self.log(f"自动恢复失败：{exc}")
             return False
 
     def collect_tasks(self) -> list[Task]:
-        indexed_tasks = []
-        for index, row in enumerate(self.rows, start=1):
-            task = row.get_data()
-            if not task.value:
-                raise ValueError(f"第 {index} 条指令参数为空")
-            indexed_tasks.append((index, task))
-
-        indexed_tasks.sort(key=lambda item: (item[1].order, item[0]))
+        indexed_tasks, errors = self.read_rows_with_errors(require_value=True)
+        if errors:
+            raise ValueError("\n".join(errors))
         return [task for _, task in indexed_tasks]
 
     def save_config(self):
@@ -1198,8 +1461,7 @@ class RPAWindow(QMainWindow):
             return
 
         try:
-            with open(filename, "w", encoding="utf-8") as file:
-                json.dump(tasks, file, indent=4, ensure_ascii=False)
+            atomic_write_json(filename, tasks)
             QMessageBox.information(self, "保存成功", "配置已保存")
         except Exception as exc:
             QMessageBox.critical(self, "保存失败", str(exc))
@@ -1221,6 +1483,11 @@ class RPAWindow(QMainWindow):
             if not isinstance(tasks, list):
                 raise ValueError("配置文件格式不正确，应为指令数组")
 
+            tasks, errors = self.normalize_config_items(tasks)
+            if not tasks:
+                details = "\n".join(errors[:10]) if errors else "没有可导入的指令"
+                raise ValueError(f"没有可导入的有效指令\n{details}")
+
             self.autosave_suspended = True
             try:
                 for row in self.rows:
@@ -1236,48 +1503,44 @@ class RPAWindow(QMainWindow):
 
             self.save_last_config()
 
-            QMessageBox.information(self, "导入成功", f"已导入 {len(tasks)} 条指令")
+            if errors:
+                QMessageBox.warning(self, "导入完成", f"已导入 {len(tasks)} 条指令，跳过 {len(errors)} 条无效指令。\n" + "\n".join(errors[:10]))
+            else:
+                QMessageBox.information(self, "导入成功", f"已导入 {len(tasks)} 条指令")
         except Exception as exc:
             QMessageBox.critical(self, "导入失败", str(exc))
 
     def start_task(self):
-        try:
-            tasks = self.collect_tasks()
-            timeout = float(self.timeout_input.text().strip() or "60")
-            if timeout <= 0:
-                raise ValueError("图片等待超时必须大于 0")
-            loop_interval = float(self.loop_interval_input.text().strip() or "0")
-            if loop_interval < 0:
-                raise ValueError("循环间隔分钟数不能小于 0")
-        except ValueError as exc:
-            QMessageBox.warning(self, "无法开始", str(exc))
-            return
-
-        if not tasks:
-            QMessageBox.warning(self, "无法开始", "请至少添加一条指令")
+        tasks, timeout, loop_interval, errors = self.validate_runtime_config()
+        if errors:
+            self.show_validation_errors("无法开始", errors)
             return
 
         self.log_area.clear()
         self.log("任务开始")
+        self.log(f"运行日志：{RUNTIME_LOG_PATH}")
+        for index, task in enumerate(tasks, start=1):
+            self.log(f"执行顺序 {index}：{self.format_task_summary(task)}")
 
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self.add_btn.setEnabled(False)
         self.save_btn.setEnabled(False)
         self.load_btn.setEnabled(False)
+        self.check_btn.setEnabled(False)
         self.log_status.setText("● RUNNING")
 
         loop = self.loop_check.currentText() == "循环执行"
-        if not loop:
-            loop_interval = 0
+
+        if self.minimize_check.isChecked():
+            self.showMinimized()
+            QApplication.processEvents()
+            time.sleep(0.25)
 
         self.worker = WorkerThread(self.engine, tasks, loop, timeout, loop_interval)
         self.worker.log_signal.connect(self.log)
         self.worker.finished_signal.connect(self.on_finished)
         self.worker.start()
-
-        if self.minimize_check.isChecked():
-            self.showMinimized()
 
     def eventFilter(self, watched, event):
         if event.type() != QEvent.KeyPress or event.modifiers() != Qt.NoModifier:
@@ -1310,6 +1573,7 @@ class RPAWindow(QMainWindow):
         self.add_btn.setEnabled(True)
         self.save_btn.setEnabled(True)
         self.load_btn.setEnabled(True)
+        self.check_btn.setEnabled(True)
         self.log_status.setText("● LIVE")
         self.log("任务已结束")
 
@@ -1319,7 +1583,15 @@ class RPAWindow(QMainWindow):
 
     def log(self, msg):
         timestamp = time.strftime("%H:%M:%S")
-        self.log_area.append(f"[{timestamp}]  >  {msg}")
+        line = f"[{timestamp}]  >  {msg}"
+        append_runtime_log(line)
+        self.log_area.append(line)
+        if self.log_area.document().blockCount() > MAX_LOG_LINES:
+            cursor = QTextCursor(self.log_area.document())
+            cursor.movePosition(QTextCursor.Start)
+            cursor.select(QTextCursor.BlockUnderCursor)
+            cursor.removeSelectedText()
+            cursor.deleteChar()
 
     def closeEvent(self, event):
         if self.worker and self.worker.isRunning():
